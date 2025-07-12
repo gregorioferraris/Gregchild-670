@@ -1,0 +1,42 @@
+#ifndef DSP_FUNCTIONS_H
+#define DSP_FUNCTIONS_H
+
+#include <cmath> // Per std::tanh, std::pow, std::sqrt, std::exp, ecc.
+#include <algorithm> // Per std::clamp
+
+namespace Gua76DSP {
+
+// --- Funzioni di Saturazione Valvolare (Softclip) ---
+
+// Saturazione basata su Tangente Iperbolica (generale, produce armoniche dispari)
+// 'x' è il segnale d'ingresso, 'drive' controlla l'intensità della saturazione.
+float tanh_saturate(float x, float drive);
+
+// Saturazione basata su Polinomio Cubico (può introdurre armoniche dispari e un po' di morbidezza)
+// Utile per una leggera compressione/saturazione prima di un clipping più forte.
+// 'x' è il segnale d'ingresso, 'strength' controlla l'intensità della curvatura.
+float cubic_saturate(float x, float strength);
+
+// Saturazione basata su ArcTan (morbida e progressiva)
+// Simile a tanh, ma con una curva leggermente diversa.
+float arctan_saturate(float x, float drive);
+
+// --- Funzioni per il Compressore Vari-Mu ---
+
+// Funzione per calcolare la Gain Reduction (GR) in dB per un Vari-Mu
+// 'detector_level_lin' è il livello del segnale di sidechain (lineare, es. RMS normalizzato tra 0 e 1).
+// 'threshold_lin' è la soglia (lineare, es. normalizzata tra 0 e 1).
+// 'max_gr_db' è la massima riduzione di guadagno possibile in dB (es. -20.0, -30.0 dB).
+float calculate_vari_mu_gr_db(float detector_level_lin, float threshold_lin, float max_gr_db);
+
+// --- Altre Utilità DSP ---
+
+// Converte un valore in dB in un fattore di guadagno lineare
+float db_to_linear(float db);
+
+// Converte un fattore di guadagno lineare in dB
+float linear_to_db(float linear);
+
+} // namespace Gua76DSP
+
+#endif // DSP_FUNCTIONS_H
