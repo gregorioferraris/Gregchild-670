@@ -1,161 +1,322 @@
-#include "dsp_functions.h"
+#include "gua76.h"
 
-namespace Gua76DSP {
+// Implementazione del Costruttore
+Gregchild::Gregchild(double sr, const LV2_Feature *const *features)
+    : sample_rate(sr),
+      gr_smooth_meter(0.0f), in_l_smooth_meter(0.0f), in_r_smooth_meter(0.0f),
+      out_l_smooth_meter(0.0f), out_r_smooth_meter(0.0f),
+      last_peak_l(0.0f), last_peak_r(0.0f)
+{
+    jfet_state.setSampleRate(sample_rate);
+    vca_state.setSampleRate(sample_rate); // Inizializza lo stato del compressore VCA
 
-// --- Funzioni di Saturazione Valvolare (Softclip) ---
+    // Inizializzazione dei programmi Fairchild (Vari-Mu)
+    // ... (existing Fairchild programs) ...
 
-float tanh_saturate(float x, float drive) {
-    // drive amplifica il segnale prima della tanh, aumentando la saturazione.
-    // Un buon range per 'drive' potrebbe essere da 1.0 a 20.0 (o più).
-    return std::tanh(x * drive);
+    // Qui potresti inizializzare i coefficienti per OptoCellState e VcaCompressorState
+    // ...
 }
 
-float cubic_saturate(float x, float strength) {
-    // strength controlla l'intensità della curvatura.
-    // Clamped_x per evitare valori estremi con x^3 che possono causare NaN o valori enormi.
-    // Questo è un softclip molto blando.
-    float clamped_x = std::clamp(x, -1.5f, 1.5f); // Limita l'input per stabilità
-    return clamped_x - (strength * clamped_x * clamped_x * clamped_x) / 3.0f;
+// Implementazione di activate()
+void Gregchild::activate() {
+    // Reset dello stato al momento dell'attivazione
+    // ... (existing meter and peak resets) ...
+
+    // Reset degli stati dei compressori
+    opto_state = Gua76DSP::OptoCellState();
+    jfet_state = Gua76DSP::JfetCompressorState();
+    jfet_state.setSampleRate(sample_rate);
+    vca_state = Gua76DSP::VcaCompressorState(); // Reset VCA state
+    vca_state.setSampleRate(sample_rate); // Ensure sample rate is set
 }
 
-float arctan_saturate(float x, float drive) {
-    // drive controlla la pendenza della curva, similmente a tanh.
-    // Il fattore (2.0f / M_PI) normalizza l'output tra -1.0 e 1.0.
-    return (2.0f / M_PI) * std::atan(x * drive);
-}
+// Implementazione di connect_port()
+void Gregchild::connect_port(uint32_t port, void *data) {
+    switch (static_cast<PortIndex>(port)) {
+        // ... (existing connections) ...
 
-// --- Funzioni per il Compressore ---
+        case COMPRESSOR_MODE:           compressor_mode_param = static_cast<const float *>(data); break;
+        case FAIRCHILD_PROGRAM:         fairchild_program_param = static_cast<const float *>(data); break;
 
-float calculate_vari_mu_gr_db(float detector_level_lin, float threshold_lin, float max_gr_db) {
-    // Questa è una modellazione semplificata che simula una ratio crescente.
-    // Il Fairchild è molto più complesso, ma questo è un buon punto di partenza.
+        case VCA_SOFT_KNEE_ON:          vca_soft_knee_on_param = static_cast<const float *>(data); break; // Nuovo
+        case VCA_KNEE_WIDTH:            vca_knee_width_param = static_cast<const float *>(data); break;   // Nuovo
 
-    detector_level_lin = std::max(0.0f, detector_level_lin);
-    threshold_lin = std::max(0.000001f, threshold_lin); // Evita divisione per zero, ~-120dB
-
-    if (detector_level_lin < threshold_lin) {
-        return 0.0f; // Nessuna compressione sotto la soglia
+        case PEAK_GR:                   peak_gr_output = static_cast<float *>(data); break; // Indici aggiornati
+        case PEAK_IN_L:                 peak_in_l_output = static_cast<float *>(data); break;
+        case PEAK_IN_R:                 peak_in_r_output = static_cast<float *>(data); break;
+        case PEAK_OUT_L:                peak_out_l_output = static_cast<float *>(data); break;
+        case PEAK_OUT_R:                peak_out_r_output = static_cast<float *>(data); break;
     }
-
-    // Calcola il livello sopra la soglia
-    float over_threshold_ratio = detector_level_lin / threshold_lin;
-
-    // Utilizzo di una funzione logaritmica per simulare la ratio crescente
-    // Un valore più grande per log_base_factor renderà la curva più "dura"
-    float log_base_factor = 1.0f; // Calibra questo valore
-    float gr_factor = std::log10(1.0f + log_base_factor * (over_threshold_ratio - 1.0f));
-
-    // Mappa questo fattore alla riduzione di guadagno in dB
-    // Il -max_gr_db assicura che GR vada da 0 a max_gr_db (negativo)
-    float gr_db = -max_gr_db * gr_factor;
-
-    // Assicurati che la riduzione non superi il max_gr_db e non sia positiva
-    return std::clamp(gr_db, -max_gr_db, 0.0f);
 }
 
-float calculate_opto_gr_db(float input_detector_level_lin, float threshold_lin, float max_gr_db_opto, OptoCellState* state) {
-    // Converti la soglia da lineare a dB per un confronto più intuitivo
-    // Per un Opto, il 'threshold' spesso influisce indirettamente sul 'trigger' del comp
-    // Qui, la 'threshold_lin' agisce più come un gain prima del detector
-    
-    input_detector_level_lin = std::max(0.0f, input_detector_level_lin); // Assicurati che sia positivo
-    
-    // Il target light level è proporzionale al segnale sopra la soglia.
-    // La scala (es. *10.0f) serve a rendere il segnale più incisivo per accendere la luce.
-    float target_light_level = std::min(1.0f, input_detector_level_lin * (1.0f / threshold_lin));
+// NUOVA funzione helper per un detector RMS (es. per VCA)
+float Gregchild::calculate_rms_level(float sample_l, float sample_r, float alpha_attack, float alpha_release) {
+    // Un semplice filtro di primo ordine per l'inviluppo RMS (squared envelope)
+    // Usiamo il detector_env dalla VcaCompressorState per mantenere lo stato
+    float input_power = (sample_l * sample_l + sample_r * sample_r) * 0.5f; // Potenza media L/R
 
-    // Smoothing per l'attacco (accensione della luce)
-    state->current_light_level += (target_light_level - state->current_light_level) * state->attack_smoothing_coeff;
+    float current_alpha = (input_power > vca_state.detector_env) ? alpha_attack : alpha_release;
+    vca_state.detector_env += (input_power - vca_state.detector_env) * current_alpha;
 
-    // Smoothing per il rilascio (spegnimento della luce) con due stadi
-    // La luce si spegne più velocemente all'inizio, poi rallenta
-    float effective_release_coeff = state->release_smoothing_coeff_fast;
-    if (state->current_light_level < state->release_transition_level) {
-        effective_release_coeff = state->release_smoothing_coeff_slow;
-    }
-    // Applica il rilascio solo se il target è inferiore al corrente (luce che si spegne)
-    if (target_light_level < state->current_light_level) {
-        state->current_light_level += (target_light_level - state->current_light_level) * effective_release_coeff;
-    }
+    // Protezione da valori negativi o NaN
+    if (vca_state.detector_env < 0.0f) vca_state.detector_env = 0.0f;
 
-
-    // Limita il livello della luce a un range sensato (0.0 - 1.0)
-    state->current_light_level = std::clamp(state->current_light_level, 0.0f, 1.0f);
-
-    // Calcola il fattore di riduzione di guadagno basato sul livello di luce
-    // Più luce = più compressione. L'esponente crea la non linearità.
-    float gr_factor = std::pow(state->current_light_level, 0.8f); // Calibra l'esponente
-
-    // Applica una riduzione di guadagno massima in dB
-    float gr_db = -max_gr_db_opto * gr_factor;
-
-    // Smooting finale della GR per evitare clicks/pops (opzionale, ma consigliato)
-    state->gr_smooth_current += (gr_db - state->gr_smooth_current) * 0.01f; // Valore piccolo per smoothing morbido
-
-    return std::clamp(state->gr_smooth_current, -max_gr_db_opto, 0.0f);
+    // Restituisce il livello RMS in dB
+    return Gua76DSP::linear_to_db(std::sqrt(vca_state.detector_env));
 }
 
-float calculate_jfet_gr_db(float peak_detector_level_db, JfetCompressorState* state) {
-    // Calcola il target GR in base alla soglia e alla ratio
-    float target_gr_db = 0.0f;
-    if (peak_detector_level_db > state->threshold_db) {
-        target_gr_db = (state->threshold_db - peak_detector_level_db) / state->ratio;
-    }
+// Modifica process_sidechain per usare i nuovi detector
+float Gregchild::process_sidechain(float input_l, float input_r, float sidechain_l, float sidechain_r) {
+    // ... (existing sidechain selection and HPF/LPF placeholders) ...
 
-    // Modalità All-Button: Aumenta la ratio e modifica i tempi per il "pomping"
-    if (state->all_button_mode_on) {
-        // Questi valori dovrebbero essere calibrati per replicare il comportamento 1176
-        // Il 1176 in All-Button ha una ratio non costante (tipo tra 12:1 e 20:1 o più)
-        // e tempi di attacco/rilascio molto specifici e aggressivi.
-        // Qui, impostiamo una ratio fissa molto alta. Potresti voler una curva più complessa.
-        if (peak_detector_level_db > state->threshold_db) {
-             target_gr_db = (state->threshold_db - peak_detector_level_db) / 20.0f; // Esempio: 20:1
+    float detector_input_abs_l = std::abs(sidechain_detector_l);
+    float detector_input_abs_r = std::abs(sidechain_detector_r);
+
+    float combined_detector_level = 0.0f; // Questo sarà il livello finale per il detector
+
+    int stereo_mode = static_cast<int>(*stereo_link_mode_param);
+    int comp_mode = static_cast<int>(*compressor_mode_param);
+
+    if (stereo_mode == 0) { // Stereo Link (tutti i compressori)
+        if (comp_mode == 2) { // JFET (usa peak)
+            // Aggiorna last_peak_l/r e usa i valori DB per JFET
+            last_peak_l = std::max(last_peak_l * 0.99f, detector_input_abs_l);
+            last_peak_r = std::max(last_peak_r * 0.99f, detector_input_abs_r);
+            // Per JFET linkato, prendiamo il massimo dei picchi e lo convertiamo in dB
+            combined_detector_level = Gua76DSP::linear_to_db(std::max(last_peak_l, last_peak_r));
+        } else if (comp_mode == 3) { // VCA (usa RMS)
+            // Usa RMS per VCA
+            combined_detector_level = calculate_rms_level(detector_input_abs_l, detector_input_abs_r, 0.01f, 0.001f); // Esempio alpha
+        } else { // Vari-Mu / Opto (RMS-like inviluppo)
+            combined_detector_level = (detector_input_abs_l + detector_input_abs_r) * 0.5f;
+            // Questo è un inviluppo semplice, un vero RMS sarebbe migliore
         }
-        // Il "pomping" in all-button è spesso un effetto collaterale di un rilascio molto veloce
-        // combinato con un attacco istantaneo e la saturazione.
-        // I coefficienti di smoothing qui sotto dovrebbero essere molto aggressivi.
-    }
+    } else if (stereo_mode == 1) { // Dual Mono - questa funzione deve ritornare il livello per il canale corrente
+        // Per Dual Mono, la logica del detector e GR deve essere duplicata per L e R nel main loop.
+        // Questa funzione helper non si adatta bene a Dual Mono.
+        // Sarà più efficiente calcolare detector_level_for_comp_l e _r direttamente nel run() loop.
+        // Per ora, restituiamo un valore, ma l'implementazione sarà diversa.
+        combined_detector_level = detector_input_abs_l; // Placeholder
+    } else { // Mid/Side
+        float M = (sidechain_detector_l + sidechain_detector_r) * 0.5f;
+        float S = (sidechain_detector_l - sidechain_detector_r) * 0.5f;
 
-    // Calcolo dei coefficienti di smoothing per attacco e rilascio
-    // Utilizziamo un filtro di primo ordine per smoothing esponenziale (tipico compressore)
-    // 1000.0f per convertire ms in secondi
-    float attack_coeff = 1.0f;
-    if (state->attack_time_ms > 0.0f) {
-        attack_coeff = 1.0f - std::exp(-1000.0f / (state->attack_time_ms * state->sample_rate));
-    } else { // Attacco istantaneo
-        attack_coeff = 1.0f;
+        if (*mid_side_link_param > 0.5f) { // Mid/Side Linked
+            if (comp_mode == 2) { // JFET (peak)
+                last_peak_l = std::max(last_peak_l * 0.99f, std::abs(M));
+                last_peak_r = std::max(last_peak_r * 0.99f, std::abs(S));
+                combined_detector_level = Gua76DSP::linear_to_db(std::max(last_peak_l, last_peak_r));
+            } else if (comp_mode == 3) { // VCA (RMS)
+                 combined_detector_level = calculate_rms_level(M, S, 0.01f, 0.001f);
+            } else { // Vari-Mu / Opto (RMS-like inviluppo)
+                combined_detector_level = (std::abs(M) + std::abs(S)) * 0.5f;
+            }
+        } else { // Mid/Side Unlinked
+            // Anche qui, il detector_level_for_comp_l e _r dovrà essere gestito separatamente nel run()
+            combined_detector_level = std::abs(M); // Placeholder
+        }
     }
-
-    float release_coeff = 1.0f;
-    if (state->release_time_ms > 0.0f) {
-        release_coeff = 1.0f - std::exp(-1000.0f / (state->release_time_ms * state->sample_rate));
-    } else { // Rilascio istantaneo
-        release_coeff = 1.0f;
+    
+    // Converti a DB per JFET e VCA, o rimani lineare per Vari-Mu/Opto, a seconda del comp_mode
+    if (comp_mode == 0 || comp_mode == 1) { // Vari-Mu / Opto (si aspettano valori lineari)
+        return combined_detector_level;
+    } else { // JFET / VCA (si aspettano valori in dB)
+        return combined_detector_level; // Già in dB dal calcolo sopra per JFET/VCA
     }
-
-    // smoothing: La GR attuale si muove verso la GR target
-    if (target_gr_db < state->current_gr_db) { // Attacco (GR sta diminuendo/diventando più negativa)
-        state->current_gr_db += (target_gr_db - state->current_gr_db) * attack_coeff;
-    } else { // Rilascio (GR sta aumentando/diventando meno negativa)
-        state->current_gr_db += (target_gr_db - state->current_gr_db) * release_coeff;
-    }
-
-    // Assicurati che GR sia non-positiva
-    return std::min(0.0f, state->current_gr_db);
 }
 
 
-// --- Altre Utilità DSP ---
+// Implementazione di run()
+void Gregchild::run(uint32_t n_samples) {
+    // ... (existing parameter setup) ...
 
-float db_to_linear(float db) {
-    return std::pow(10.0f, db / 20.0f);
-}
+    const int compressor_mode = static_cast<int>(*compressor_mode_param); // Ora può essere 0, 1, 2, 3 (Vari-Mu, Opto, JFET, VCA)
+    const int fairchild_program_idx = static_cast<int>(*fairchild_program_param);
 
-float linear_to_db(float linear) {
-    if (linear <= 0.000000001f) { // Un valore molto piccolo vicino a zero
-        return -120.0f; // Un valore molto basso per evitare log(0)
+    // Parametri JFET (usati solo in modalità JFET)
+    jfet_state.attack_time_ms = *attack_param;
+    jfet_state.release_time_ms = *release_param;
+    jfet_state.ratio = *ratio_param;
+    jfet_state.all_button_mode_on = (static_cast<int>(*ratio_param) == 4);
+    //jfet_state.threshold_db = Gua76DSP::linear_to_db(*input_gain_param * 1.5f); // Example threshold
+
+    // Parametri VCA (usati solo in modalità VCA)
+    vca_state.threshold_db = Gua76DSP::linear_to_db(*input_gain_param * 1.5f); // Esempio: soglia dal gain input
+    vca_state.ratio = *ratio_param; // Usa la stessa ratio enumerata del JFET per semplicità
+    vca_state.attack_time_ms = *attack_param;
+    vca_state.release_time_ms = *release_param;
+    vca_state.soft_knee_on = (*vca_soft_knee_on_param > 0.5f);
+    vca_state.knee_width_db = *vca_knee_width_param;
+    
+    // ... (existing Opto parameters) ...
+
+    // Loop principale di elaborazione per sample
+    for (uint32_t i = 0; i < n_samples; ++i) {
+        float sample_l = audio_in_l[i];
+        float sample_r = audio_in_r[i];
+
+        // --- 1. Processing Pre-Compression ---
+        // ... (existing pad, input softclip, input gain, drive/saturation) ...
+
+        // --- 2. Sidechain Processing and Detector ---
+        float sidechain_detector_l_val = audio_in_l[i]; // Default: input audio
+        float sidechain_detector_r_val = audio_in_r[i];
+
+        if (sidechain_in_l) sidechain_detector_l_val = sidechain_in_l[i];
+        if (sidechain_in_r) sidechain_detector_r_val = sidechain_in_r[i];
+
+        // QUI VANNO I FILTRI DEL SIDECHAIN (HPF/LPF) - placeholders
+        // Filtra sidechain_detector_l_val e _r_val
+        // ...
+
+        float detector_level_l = 0.0f; // Livello per il calcolo della GR canale L
+        float detector_level_r = 0.0f; // Livello per il calcolo della GR canale R
+
+        int stereo_mode = static_cast<int>(*stereo_link_mode_param);
+        if (stereo_mode == 0) { // Stereo Link (per tutti i tipi di compressore)
+            // Calcola un singolo livello detector combinato L+R
+            if (compressor_mode == 2) { // JFET (usa peak in dB)
+                last_peak_l = std::max(last_peak_l * 0.99f, std::abs(sidechain_detector_l_val));
+                last_peak_r = std::max(last_peak_r * 0.99f, std::abs(sidechain_detector_r_val));
+                detector_level_l = Gua76DSP::linear_to_db(std::max(last_peak_l, last_peak_r));
+                detector_level_r = detector_level_l;
+            } else if (compressor_mode == 3) { // VCA (usa RMS in dB)
+                detector_level_l = calculate_rms_level(sidechain_detector_l_val, sidechain_detector_r_val, 0.01f, 0.001f);
+                detector_level_r = detector_level_l;
+            } else { // Vari-Mu / Opto (usa inviluppo lineare)
+                detector_level_l = (std::abs(sidechain_detector_l_val) + std::abs(sidechain_detector_r_val)) * 0.5f;
+                detector_level_r = detector_level_l;
+            }
+        } else if (stereo_mode == 1) { // Dual Mono (detector separato per L e R)
+            if (compressor_mode == 2) { // JFET
+                last_peak_l = std::max(last_peak_l * 0.99f, std::abs(sidechain_detector_l_val));
+                last_peak_r = std::max(last_peak_r * 0.99f, std::abs(sidechain_detector_r_val));
+                detector_level_l = Gua76DSP::linear_to_db(last_peak_l);
+                detector_level_r = Gua76DSP::linear_to_db(last_peak_r);
+            } else if (compressor_mode == 3) { // VCA
+                // Avremmo bisogno di 2 istanze di VcaCompressorState per il vero dual mono
+                // Per ora, useremo lo stesso stato, ma il detector RMS dovrà essere applicato per ogni canale.
+                // Questa è una semplificazione che NON è un vero dual mono.
+                detector_level_l = Gua76DSP::linear_to_db(std::sqrt(sidechain_detector_l_val * sidechain_detector_l_val)); // Semplice RMS per un sample
+                detector_level_r = Gua76DSP::linear_to_db(std::sqrt(sidechain_detector_r_val * sidechain_detector_r_val));
+            } else { // Vari-Mu / Opto
+                detector_level_l = std::abs(sidechain_detector_l_val);
+                detector_level_r = std::abs(sidechain_detector_r_val);
+            }
+        } else { // Mid/Side
+            float M = (sample_l + sample_r) * 0.5f; // Converti l'audio in M/S per il processamento
+            float S = (sample_l - sample_r) * 0.5f;
+
+            float detector_M_val = (sidechain_detector_l_val + sidechain_detector_r_val) * 0.5f;
+            float detector_S_val = (sidechain_detector_l_val - sidechain_detector_r_val) * 0.5f;
+
+            if (*mid_side_link_param > 0.5f) { // Mid/Side Linked (un singolo detector per M+S)
+                if (compressor_mode == 2) { // JFET
+                    last_peak_l = std::max(last_peak_l * 0.99f, std::abs(detector_M_val));
+                    last_peak_r = std::max(last_peak_r * 0.99f, std::abs(detector_S_val));
+                    detector_level_l = Gua76DSP::linear_to_db(std::max(last_peak_l, last_peak_r));
+                    detector_level_r = detector_level_l;
+                } else if (compressor_mode == 3) { // VCA
+                    detector_level_l = calculate_rms_level(detector_M_val, detector_S_val, 0.01f, 0.001f);
+                    detector_level_r = detector_level_l;
+                } else { // Vari-Mu / Opto
+                    detector_level_l = (std::abs(detector_M_val) + std::abs(detector_S_val)) * 0.5f;
+                    detector_level_r = detector_level_l;
+                }
+            } else { // Mid/Side Unlinked (detector separati per M e S)
+                if (compressor_mode == 2) { // JFET
+                    last_peak_l = std::max(last_peak_l * 0.99f, std::abs(detector_M_val));
+                    last_peak_r = std::max(last_peak_r * 0.99f, std::abs(detector_S_val));
+                    detector_level_l = Gua76DSP::linear_to_db(last_peak_l); // M detector
+                    detector_level_r = Gua76DSP::linear_to_db(last_peak_r); // S detector
+                } else if (compressor_mode == 3) { // VCA
+                    detector_level_l = Gua76DSP::linear_to_db(std::sqrt(detector_M_val * detector_M_val)); // M RMS
+                    detector_level_r = Gua76DSP::linear_to_db(std::sqrt(detector_S_val * detector_S_val)); // S RMS
+                } else { // Vari-Mu / Opto
+                    detector_level_l = std::abs(detector_M_val); // M inviluppo
+                    detector_level_r = std::abs(detector_S_val); // S inviluppo
+                }
+            }
+            sample_l = M; // Per continuare il processamento su M
+            sample_r = S; // Per continuare il processamento su S
+        }
+        
+        // --- 3. Calcolo della Gain Reduction (GR) in base al Compressor Mode ---
+        float gr_lin_l = 1.0f;
+        float gr_lin_r = 1.0f;
+        float current_gr_db_l = 0.0f; // Per il meter
+
+        if (!bypass_on) {
+            if (compressor_mode == 0) { // Vari-Mu (Fairchild 670 Style)
+                const VariMuProgramParams& program = fairchild_programs[fairchild_program_idx];
+                current_gr_db_l = Gua76DSP::calculate_vari_mu_gr_db(detector_level_l, program.detector_threshold_lin, program.max_gr_db_val);
+                gr_lin_l = Gua76DSP::db_to_linear(current_gr_db_l);
+
+                if (stereo_mode == 1 || (stereo_mode == 2 && *mid_side_link_param <= 0.5f)) { // Dual Mono / M/S Unlinked
+                    float vari_mu_gr_db_r = Gua76DSP::calculate_vari_mu_gr_db(detector_level_r, program.detector_threshold_lin, program.max_gr_db_val);
+                    gr_lin_r = Gua76DSP::db_to_linear(vari_mu_gr_db_r);
+                } else {
+                    gr_lin_r = gr_lin_l;
+                }
+            } else if (compressor_mode == 1) { // Opto (LA-2A Style)
+                current_gr_db_l = Gua76DSP::calculate_opto_gr_db(detector_level_l, Gua76DSP::db_to_linear(-10.0f), 20.0f, &opto_state);
+                gr_lin_l = Gua76DSP::db_to_linear(current_gr_db_l);
+
+                if (stereo_mode == 1 || (stereo_mode == 2 && *mid_side_link_param <= 0.5f)) {
+                    // Nota: per un vero dual mono o M/S unlinked per Opto, avresti bisogno di un'altra OptoCellState per R/S
+                    float opto_gr_db_r = Gua76DSP::calculate_opto_gr_db(detector_level_r, Gua76DSP::db_to_linear(-10.0f), 20.0f, &opto_state);
+                    gr_lin_r = Gua76DSP::db_to_linear(opto_gr_db_r);
+                } else {
+                    gr_lin_r = gr_lin_l;
+                }
+            } else if (compressor_mode == 2) { // JFET (1176 Style)
+                jfet_state.threshold_db = *input_gain_param * 40.0f - 20.0f; // Esempio di soglia in dB
+                current_gr_db_l = Gua76DSP::calculate_jfet_gr_db(detector_level_l, &jfet_state);
+                gr_lin_l = Gua76DSP::db_to_linear(current_gr_db_l);
+
+                if (stereo_mode == 1 || (stereo_mode == 2 && *mid_side_link_param <= 0.5f)) {
+                    // Nota: per un vero dual mono JFET, servirebbe un'altra JfetCompressorState per R/S
+                    float jfet_gr_db_r = Gua76DSP::calculate_jfet_gr_db(detector_level_r, &jfet_state);
+                    gr_lin_r = Gua76DSP::db_to_linear(jfet_gr_db_r);
+                } else {
+                    gr_lin_r = gr_lin_l;
+                }
+            } else { // VCA (Nuovo!)
+                vca_state.threshold_db = *input_gain_param * 40.0f - 20.0f; // Esempio di soglia in dB
+                current_gr_db_l = Gua76DSP::calculate_vca_gr_db(detector_level_l, &vca_state);
+                gr_lin_l = Gua76DSP::db_to_linear(current_gr_db_l);
+
+                if (stereo_mode == 1 || (stereo_mode == 2 && *mid_side_link_param <= 0.5f)) {
+                    // Nota: per un vero dual mono VCA, avresti bisogno di un'altra VcaCompressorState per R/S
+                    float vca_gr_db_r = Gua76DSP::calculate_vca_gr_db(detector_level_r, &vca_state);
+                    gr_lin_r = Gua76DSP::db_to_linear(vca_gr_db_r);
+                } else {
+                    gr_lin_r = gr_lin_l;
+                }
+            }
+        }
+        
+        // --- 4. Applicazione della Gain Reduction e Output Gain ---
+        // Se in modalità Mid/Side, applica la GR a M e S
+        if (stereo_mode == 2 && *mid_side_link_param <= 0.5f) { // Mid/Side Unlinked
+            sample_l *= gr_lin_l; // M channel
+            sample_r *= gr_lin_r; // S channel
+
+            // Riconverti M/S in L/R per l'uscita
+            float output_l = (sample_l + sample_r);
+            float output_r = (sample_l - sample_r);
+            sample_l = output_l;
+            sample_r = output_r;
+        } else {
+            sample_l *= gr_lin_l;
+            sample_r *= gr_lin_r;
+        }
+
+        // ... (existing output gain and output softclip) ...
+
+        // --- 5. Metering ---
+        // ... (existing metering logic) ...
+        update_meter(gr_smooth_meter, current_gr_db_l, 0.1f); // GR in dB (usiamo l'L/M channel per il meter comune)
     }
-    return 20.0f * std::log10(linear);
+    // ... (existing meter output) ...
 }
-
-} // namespace Gua76DSP
