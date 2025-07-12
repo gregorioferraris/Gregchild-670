@@ -1,8 +1,13 @@
 #ifndef DSP_FUNCTIONS_H
 #define DSP_FUNCTIONS_H
 
-#include <cmath> // Per std::tanh, std::pow, std::sqrt, std::exp, ecc.
-#include <algorithm> // Per std::clamp
+#include <cmath>     // Per std::tanh, std::pow, std::sqrt, std::exp, std::atan
+#include <algorithm> // Per std::clamp, std::max, std::min
+
+// Definisci M_PI se non è già definito (comune in C++ standard recente o con GCC/Clang)
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 namespace Gua76DSP {
 
@@ -21,13 +26,69 @@ float cubic_saturate(float x, float strength);
 // Simile a tanh, ma con una curva leggermente diversa.
 float arctan_saturate(float x, float drive);
 
-// --- Funzioni per il Compressore Vari-Mu ---
+// --- Stati per i Tipi di Compressore ---
 
-// Funzione per calcolare la Gain Reduction (GR) in dB per un Vari-Mu
-// 'detector_level_lin' è il livello del segnale di sidechain (lineare, es. RMS normalizzato tra 0 e 1).
-// 'threshold_lin' è la soglia (lineare, es. normalizzata tra 0 e 1).
-// 'max_gr_db' è la massima riduzione di guadagno possibile in dB (es. -20.0, -30.0 dB).
+// Stato per la simulazione della fotocellula ottica
+struct OptoCellState {
+    float current_light_level;      // Livello di "luce" che colpisce la fotocellula (normalizzato 0-1)
+    float attack_smoothing_coeff;   // Velocità di accensione del pannello EL
+    float release_smoothing_coeff_fast; // Velocità di rilascio iniziale della fotocellula
+    float release_smoothing_coeff_slow; // Velocità di rilascio lenta della fotocellula
+    float release_transition_level; // Soglia di luce per transizione rilascio
+    float gr_smooth_current;        // GR attuale levigata
+
+    OptoCellState() :
+        current_light_level(0.0f),
+        attack_smoothing_coeff(0.005f), // Attacco lento (es. 5ms a 44.1kHz)
+        release_smoothing_coeff_fast(0.001f), // Rilascio iniziale un po' più veloce (1ms)
+        release_smoothing_coeff_slow(0.0001f), // Rilascio lento (10ms)
+        release_transition_level(0.3f), // Esempio: transizione al 30% della luce
+        gr_smooth_current(0.0f) {}
+};
+
+// Stato per la simulazione del compressore JFET
+struct JfetCompressorState {
+    float attack_time_ms;          // Tempo di attacco in ms
+    float release_time_ms;         // Tempo di rilascio in ms
+    float ratio;                   // Rapporto di compressione
+    float threshold_db;            // Soglia in dB
+    float current_gr_db;           // Riduzione di guadagno attuale in dB
+    float sample_rate;             // Frequenza di campionamento
+    bool  all_button_mode_on;      // Se la modalità All-Button è attiva
+
+    JfetCompressorState() :
+        attack_time_ms(0.02f),      // Attacco ultra-veloce (20us)
+        release_time_ms(50.0f),     // Rilascio tipico
+        ratio(4.0f),
+        threshold_db(-15.0f),
+        current_gr_db(0.0f),
+        sample_rate(44100.0f),
+        all_button_mode_on(false) {}
+
+    // Imposta il sample rate per calcoli futuri
+    void setSampleRate(float sr) { sample_rate = sr; }
+};
+
+// --- Funzioni per il Compressore ---
+
+// Calcola la Gain Reduction (GR) in dB per un Vari-Mu
+// 'detector_level_lin': livello del segnale di sidechain (lineare, es. RMS normalizzato tra 0 e 1).
+// 'threshold_lin': soglia (lineare, es. normalizzata tra 0 e 1).
+// 'max_gr_db': massima riduzione di guadagno possibile in dB (es. -20.0, -30.0 dB).
 float calculate_vari_mu_gr_db(float detector_level_lin, float threshold_lin, float max_gr_db);
+
+// Calcola il fattore di riduzione di guadagno per una cellula ottica
+// 'input_detector_level_lin': livello del segnale per il detector (sidechain RMS)
+// 'threshold_lin': soglia desiderata (lineare)
+// 'max_gr_db_opto': massima riduzione di guadagno desiderata (e.g., -20 dB)
+// 'state': puntatore allo stato della cellula ottica
+float calculate_opto_gr_db(float input_detector_level_lin, float threshold_lin, float max_gr_db_opto, OptoCellState* state);
+
+// Calcola la riduzione di guadagno per un compressore JFET (1176-style)
+// 'peak_detector_level_db': livello di picco del segnale (sidechain, in dB)
+// 'state': puntatore allo stato del compressore JFET
+float calculate_jfet_gr_db(float peak_detector_level_db, JfetCompressorState* state);
+
 
 // --- Altre Utilità DSP ---
 
